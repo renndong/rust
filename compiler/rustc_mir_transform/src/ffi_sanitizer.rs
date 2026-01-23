@@ -2,16 +2,17 @@ use rustc_middle::mir::*;
 use rustc_middle::ty;
 use rustc_middle::ty::TyCtxt;
 
-pub(super) struct FFIInstr;
+pub(super) struct FFISanitizer;
 
-impl<'tcx> crate::MirPass<'tcx> for FFIInstr {
+impl<'tcx> crate::MirPass<'tcx> for FFISanitizer {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if !should_instrument(tcx, body) {
-            println!("Skipping FFIInstr");
+        if !tcx.features().ffi_san() {
             return;
         }
-
-        println!("FFIInstr");
+        if !should_instrument(tcx, body) {
+            return;
+        }
+        instrument(tcx, body);
     }
 
     fn is_required(&self) -> bool {
@@ -36,4 +37,11 @@ fn should_instrument<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
         }
     }
     return has_ffi;
+}
+
+fn instrument<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    _ = tcx;
+    _ = body;
+
+    
 }

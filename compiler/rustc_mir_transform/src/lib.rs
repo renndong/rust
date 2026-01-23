@@ -144,7 +144,7 @@ declare_passes! {
     mod elaborate_box_derefs : ElaborateBoxDerefs;
     mod elaborate_drops : ElaborateDrops;
     mod function_item_references : FunctionItemReferences;
-    mod ffi_instr : FFIInstr;
+    mod ffi_sanitizer : FFISanitizer;
     mod gvn : GVN;
     // Made public so that `mir_drops_elaborated_and_const_checked` can be overridden
     // by custom rustc drivers, running all the steps by themselves. See #114628.
@@ -680,7 +680,7 @@ pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
             &check_alignment::CheckAlignment,
             &check_null::CheckNull,
             &check_enums::CheckEnums,
-            &ffi_instr::FFIInstr,
+            &ffi_sanitizer::FFISanitizer,
             // Before inlining: trim down MIR with passes to reduce inlining work.
 
             // Has to be done before inlining, otherwise actual call will be almost always inlined.
