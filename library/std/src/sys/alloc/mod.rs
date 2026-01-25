@@ -75,7 +75,8 @@ cfg_select! {
         target_os = "teeos",
         target_os = "trusty",
     ) => {
-        mod unix;
+        // mod unix;
+        mod ffi_sanitizer;
     }
     target_os = "windows" => {
         mod windows;
