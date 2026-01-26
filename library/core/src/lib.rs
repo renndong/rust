@@ -312,6 +312,9 @@ pub mod ffi;
 #[allow(missing_docs)]
 #[unstable(feature = "ffi_sanitizer", issue = "none")]
 pub mod ffi_sanitizer;
+#[allow(missing_docs)]
+#[unstable(feature = "libffisan", issue = "none")]
+pub mod libffisan;
 #[unstable(feature = "core_io_borrowed_buf", issue = "117693")]
 pub mod io;
 pub mod iter;

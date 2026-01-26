@@ -4,10 +4,8 @@
 // use crate::alloc;
 // use crate::core::ptr;
 use crate::marker::PointeeSized;
-
-unsafe extern "C" {
-    fn __ffi_sanitizer_get_metadata(pointer: *mut u8) -> i32;
-}
+use crate::libffisan;
+use crate::ffi;
 
 #[track_caller]
 #[unstable(feature = "ffi_sanitizer", issue = "none")]
@@ -22,11 +20,11 @@ pub unsafe fn ffi_sanitizer_non_null<T: PointeeSized>(pointer: *mut T) {
 #[unstable(feature = "ffi_sanitizer", issue = "none")]
 #[rustc_diagnostic_item = "ffi_sanitizer_non_free"]
 pub unsafe fn ffi_sanitizer_non_free<T: PointeeSized>(pointer: *mut T) {
-    let raw = pointer as *mut u8;
+    let raw = pointer as *mut ffi::c_void;
     let metadata = unsafe {
-        __ffi_sanitizer_get_metadata(raw)
+        libffisan::__ffi_sanitizer_get_header(raw)
     };
-    if metadata != 0 {
+    if metadata.is_null() {
         panic!("non free");
     }
 }
