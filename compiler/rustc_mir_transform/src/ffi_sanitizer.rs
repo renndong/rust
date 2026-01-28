@@ -1,19 +1,27 @@
 #![allow(dead_code)]
+#![allow(warnings)]
 
+use rustc_abi::ExternAbi;
 use rustc_hir as hir;
 use rustc_middle::mir::*;
 use rustc_middle::ty;
 use rustc_middle::ty::TyCtxt;
+use rustc_span::source_map::{Spanned, dummy_spanned};
 use rustc_span::symbol::Symbol;
+use rustc_span::{DUMMY_SP, sym};
 
 pub(super) struct FFISanitizer;
 
 impl<'tcx> crate::MirPass<'tcx> for FFISanitizer {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if !tcx.features().ffi_sanitizer() || !should_instrument(tcx, body) {
+        if !tcx.features().ffi_sanitizer() {
             return;
         }
-        instrument(tcx, body);
+        if has_ffi_call(tcx, body) {
+            instrument_func_with_ffi_call(tcx, body);
+        } else if can_be_ffi_call(tcx, body) {
+            instrument_func_can_be_ffi_call(tcx, body);
+        }
     }
 
     fn is_required(&self) -> bool {
@@ -28,7 +36,7 @@ fn is_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, func: &Operand<'tcx>)
     return false;
 }
 
-fn should_instrument<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
+fn has_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
     for (_, block) in body.basic_blocks.iter_enumerated() {
         let Some(terminator) = &block.terminator else { continue };
         if let TerminatorKind::Call { func, .. } = &terminator.kind {
@@ -40,78 +48,249 @@ fn should_instrument<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
     return false;
 }
 
-fn instrument<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-    let name = "ffi_sanitizer_non_null";
-    let symbol_name = Symbol::intern(name);
+fn can_be_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
+    let def_id = body.source.def_id().expect_local().to_def_id();
 
-    let Some(san_fn_def_id) = tcx.get_diagnostic_item(symbol_name) else { return };
+    if tcx.visibility(def_id).is_public() {
+        println!("pub");
+    }
+    if tcx.has_attr(def_id, sym::no_mangle) {
+        println!("no mangle");
+    }
+    if tcx.has_attr(def_id, sym::export_name) {
+        println!("export name");
+    }
 
-    for bb in START_BLOCK..body.basic_blocks.next_index() {
-        let TerminatorKind::Call { func, args, destination, target, unwind, call_source, fn_span } =
-            body[bb].terminator().kind.clone()
-        else {
-            continue;
-        };
+    if let ExternAbi::C { .. } = tcx.fn_sig(def_id).skip_binder().abi() {
+        println!("c");
+    }
 
-        if !is_ffi_call(tcx, body, &func) {
-            continue;
+    if tcx.visibility(def_id).is_public()
+        && tcx.has_attr(def_id, sym::no_mangle)
+        && let ExternAbi::C { .. } = tcx.fn_sig(def_id).skip_binder().abi()
+    {
+        return true;
+    }
+    return false;
+}
+
+fn instrument_func_with_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    for current in START_BLOCK..body.basic_blocks.next_index() {
+        match body[current].terminator().kind {
+            TerminatorKind::Call { .. } => instrument_call(tcx, body, current),
+            TerminatorKind::Return { .. } => instrument_return(tcx, body, current),
+            TerminatorKind::TailCall { .. } => instrument_ptr_use_term(tcx, body, current),
+            TerminatorKind::Drop { .. } => instrument_drop(tcx, body, current), // may never execute
+            _ => {}
         }
+    }
+}
 
-        let source_info = body[bb].terminator().source_info;
-        let second_terminator = Terminator {
+fn select_raw_ptr_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+    args: &Box<[Spanned<Operand<'tcx>>]>,
+) -> Vec<(ty::Ty<'tcx>, Spanned<Operand<'tcx>>)> {
+    let mut func_args = Vec::new();
+    for arg in args.iter() {
+        match &arg.node {
+            Operand::Copy(place) | Operand::Move(place) => {
+                if let ty::RawPtr(pty, _) = place.ty(&body.local_decls, tcx).ty.kind() {
+                    func_args.push((pty.clone(), arg.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    return func_args;
+}
+
+fn instrument_return<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {
+    let ty::RawPtr(pty, _) = body.return_ty().kind() else { return };
+    let ret_place = Place::from(RETURN_PLACE);
+
+    let pre_cond_fn_name = "ffi_sanitizer_use_pre_cond";
+    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
+    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
+
+    let block = BasicBlockData::new(Some(body[current].terminator().clone()), false);
+    let ret_bb = body.basic_blocks_mut().push(block);
+
+    let source_info = body[current].terminator().source_info;
+    let pre_cond_fn =
+        Operand::function_handle(tcx, pre_cond_fn_def_id, [pty.clone().into()], source_info.span);
+
+    let fn_arg = dummy_spanned(Operand::Copy(ret_place));
+    body[current].terminator_mut().kind = TerminatorKind::Call {
+        func: pre_cond_fn,
+        args: [fn_arg].into(),
+        destination: Place::return_place(),
+        target: Some(ret_bb),
+        unwind: UnwindAction::Unreachable,
+        call_source: CallSource::Normal,
+        fn_span: DUMMY_SP,
+    };
+}
+
+fn instrument_ptr_use_term<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {}
+
+fn instrument_call<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {
+    let TerminatorKind::Call { func, args, destination, target, unwind, call_source, fn_span } =
+        body[current].terminator().kind.clone()
+    else {
+        return;
+    };
+    if !is_ffi_call(tcx, body, &func) {
+        return instrument_ptr_use_term(tcx, body, current);
+    }
+
+    // get pre condition
+    let pre_cond_fn_name = "ffi_sanitizer_ffi_pre_cond";
+    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
+    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
+
+    // get post condition
+    let post_cond_fn_name = "ffi_sanitizer_ffi_post_cond";
+    let post_cond_fn_symbol = Symbol::intern(post_cond_fn_name);
+    let Some(post_cond_fn_def_id) = tcx.get_diagnostic_item(post_cond_fn_symbol) else { return };
+
+    let func_args = select_raw_ptr_args(tcx, body, &args);
+    if func_args.is_empty() {
+        return;
+    }
+
+    let source_info = body[current].terminator().source_info;
+
+    // create basic blocks for pre condition function
+    let mut pre_cond_bb = Vec::new();
+    for (generic_arg, func_arg) in func_args.iter().cloned() {
+        let pre_cond_fn = Operand::function_handle(
+            tcx,
+            pre_cond_fn_def_id,
+            [generic_arg.into()],
+            source_info.span,
+        );
+
+        let terminator = Terminator {
             source_info,
             kind: TerminatorKind::Call {
-                func: func.clone(),
-                args: args.clone(),
-                destination,
-                target,
+                func: pre_cond_fn,
+                args: [func_arg.into()].into(),
+                destination: Place::return_place(),
+                target: Some(BasicBlock::ZERO),
                 unwind,
                 call_source,
                 fn_span,
             },
         };
 
-        let mut san_func_args = Vec::new();
-        for arg in args.iter() {
-            match &arg.node {
-                Operand::Copy(place) => {
-                    if let ty::RawPtr(pty, _) = place.ty(&body.local_decls, tcx).ty.kind() {
-                        san_func_args.push((pty.clone(), arg.clone()));
-                    }
-                }
-                Operand::Move(_) => {
-                    println!("move");
-                }
-                Operand::Constant(_) => {
-                    println!("const");
-                }
-            }
-        }
+        let block = BasicBlockData::new(Some(terminator), false);
+        let bb = body.basic_blocks_mut().push(block);
+        pre_cond_bb.push(bb);
+    }
 
-        let Some((generic_arg, san_arg)) = san_func_args.pop() else {
-            println!("generic_arg is none");
-            continue;
-        };
-
-        let second_block = BasicBlockData::new(Some(second_terminator), false);
-        let second_idx = body.basic_blocks_mut().push(second_block);
-
-        let san_func =
-            Operand::function_handle(tcx, san_fn_def_id, [generic_arg.into()], source_info.span);
-
-        let first_terminator = TerminatorKind::Call {
-            func: san_func,
-            args: [san_arg.into()].into(),
-            destination: Place::return_place(),
-            target: Some(second_idx),
+    // create a basic block for the ffi call
+    let terminator = Terminator {
+        source_info,
+        kind: TerminatorKind::Call {
+            func: func.clone(),
+            args: args.clone(),
+            destination,
+            target: Some(BasicBlock::ZERO),
             unwind,
             call_source,
             fn_span,
+        },
+    };
+    let ffi_call_bb = body.basic_blocks_mut().push(BasicBlockData::new(Some(terminator), false));
+
+    // create basic blocks for post condition function
+    let mut post_cond_bb = Vec::new();
+    for (generic_arg, func_arg) in func_args.iter().cloned() {
+        let post_cond_fn = Operand::function_handle(
+            tcx,
+            post_cond_fn_def_id,
+            [generic_arg.into()],
+            source_info.span,
+        );
+
+        let terminator = Terminator {
+            source_info,
+            kind: TerminatorKind::Call {
+                func: post_cond_fn,
+                args: [func_arg.into()].into(),
+                destination: Place::return_place(),
+                target: Some(BasicBlock::ZERO),
+                unwind,
+                call_source,
+                fn_span,
+            },
         };
-        let terminator = body[bb].terminator.as_mut().expect("invalid terminator");
-        terminator.kind = first_terminator;
+
+        let block = BasicBlockData::new(Some(terminator), false);
+        let bb = body.basic_blocks_mut().push(block);
+        post_cond_bb.push(bb);
     }
-    // body.basic_blocks = BasicBlocks::new(blocks);
+
+    /*
+     * next we link the new created basic block
+     */
+
+    // set a terminator goto the first pre cond block
+    if let Some(terminator) = body[current].terminator.as_mut() {
+        *terminator = Terminator {
+            source_info,
+            kind: TerminatorKind::Goto { target: *pre_cond_bb.first().unwrap() },
+        };
+    }
+
+    for (idx, &pre_bb) in pre_cond_bb.iter().enumerate() {
+        let target = if let Some(val) = pre_cond_bb.get(idx + 1) { *val } else { ffi_call_bb };
+        body[pre_bb].terminator_mut().successors_mut(|bb| *bb = target);
+    }
+
+    let first_post_bb = post_cond_bb[0];
+    body[ffi_call_bb].terminator_mut().successors_mut(|bb| *bb = first_post_bb);
+
+    for (idx, &post_bb) in post_cond_bb.iter().enumerate() {
+        let target = if let Some(val) = post_cond_bb.get(idx + 1) { *val } else { target.unwrap() };
+        body[post_bb].terminator_mut().successors_mut(|bb| *bb = target);
+    }
+}
+
+fn instrument_drop<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {
+    let TerminatorKind::Drop { place, target, unwind, replace, drop, async_fut } =
+        body[current].terminator().kind
+    else {
+        return;
+    };
+
+    let pre_cond_fn_name = "ffi_sanitizer_drop_pre_cond";
+    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
+    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
+    let ty::RawPtr(generic_arg, _) = place.ty(&body.local_decls, tcx).ty.kind() else { return };
+
+    let block = BasicBlockData::new(Some(body[current].terminator().clone()), false);
+    let drop_bb = body.basic_blocks_mut().push(block);
+
+    let source_info = body[current].terminator().source_info;
+    let pre_cond_fn = Operand::function_handle(
+        tcx,
+        pre_cond_fn_def_id,
+        [generic_arg.clone().into()],
+        source_info.span,
+    );
+
+    let fn_arg = dummy_spanned(Operand::Copy(place));
+    body[current].terminator_mut().kind = TerminatorKind::Call {
+        func: pre_cond_fn,
+        args: [fn_arg].into(),
+        destination: Place::return_place(),
+        target: Some(drop_bb),
+        unwind,
+        call_source: CallSource::Normal,
+        fn_span: DUMMY_SP,
+    };
 }
 
 fn find_function_by_name<'tcx>(
@@ -126,10 +305,18 @@ fn find_function_by_name<'tcx>(
             let def_path = tcx.def_path(local_def_id.to_def_id());
             // 检查路径的最后一部分是否匹配名称
             if def_path.data.last().map_or(false, |data| data.data.get_opt_name() == Some(name)) {
-                eprintln!("Found function {:?} at {:?}", name, tcx.def_path_str(local_def_id.to_def_id()));
+                eprintln!(
+                    "Found function {:?} at {:?}",
+                    name,
+                    tcx.def_path_str(local_def_id.to_def_id())
+                );
                 return Some(local_def_id.to_def_id());
             }
         }
     }
     None
+}
+
+fn instrument_func_can_be_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    println!("xxxx");
 }

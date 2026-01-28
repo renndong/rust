@@ -1,4 +1,5 @@
-use core::libffisan;
+use core::libffisan::F_ALLOC_C;
+use core::{ffi, libffisan};
 
 use super::{MIN_ALIGN, realloc_fallback};
 use crate::alloc::{GlobalAlloc, Layout, System};
@@ -31,7 +32,19 @@ unsafe impl GlobalAlloc for System {
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        unsafe { libffisan::__ffi_sanitizer_rust_free(ptr as *mut libc::c_void) }
+        unsafe { 
+            let header = libffisan::__ffi_sanitizer_get_header(ptr as *mut ffi::c_void);
+            if !header.is_null() {
+                let header = &*header;
+                if header.cps.f_free() != 0 {
+                    panic!("FFI Probe: double free detected");
+                }
+                if header.cps.f_alloc() == F_ALLOC_C {
+                    panic!("FFI Probe: undefind behavior: object alloc in C but dealloc in Rust");
+                }
+            }
+            libffisan::__ffi_sanitizer_rust_free(ptr as *mut libc::c_void) 
+        }
     }
 
     #[inline]

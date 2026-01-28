@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define __FFISAN_INNER__
 #include "ffisan.h"
+#include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
@@ -16,7 +17,7 @@ static void *(*libc_malloc)(size_t) = NULL;
 static void (*libc_free)(void *) = NULL;
 static void *(*libc_realloc)(void *, size_t) = NULL;
 
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
 #include <stdatomic.h>
 
@@ -42,6 +43,66 @@ int safe_log(const char *restrict format, ...) {
 #define atomic_fetch_add(...)
 
 #endif
+
+/**************************  alloc list definition ****************************/
+
+static list_head_t alloc_list;
+
+static inline void list_node_init(list_node_t *node) {
+  node->self = NULL;
+  node->prev = node;
+  node->next = node;
+}
+
+static list_node_t *list_new_node(void *self) {
+  list_node_t *node;
+
+  node = (list_node_t *)libc_malloc(sizeof(list_node_t));
+  list_node_init(node);
+  node->self = self;
+  return node;
+}
+
+static inline uintptr_t list_node_low48(list_node_t *node) {
+  uintptr_t pval = (uintptr_t)node;
+
+  assert((pval & ((uintptr_t)0xffff << 48)) == 0);
+  return pval & ((1ULL << 48) - 1);
+}
+
+static inline void list_remove(list_head_t *head, list_node_t *node) {
+  pthread_mutex_lock(&head->mutex);
+  if (node->prev != node && node->next != node) {
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+    node->prev = node;
+    node->next = node;
+  }
+  pthread_mutex_unlock(&head->mutex);
+}
+
+static inline void list_insert(list_head_t *head, list_node_t *node) {
+  pthread_mutex_lock(&head->mutex);
+  node->next = head->head.next;
+  node->prev = &head->head;
+  head->head.next->prev = node;
+  head->head.next = node;
+  pthread_mutex_unlock(&head->mutex);
+}
+
+static list_node_t *list_pop_front(list_head_t *head) {
+  list_node_t *node = NULL;
+  pthread_mutex_lock(&head->mutex);
+  if (head->head.next != &head->head) {
+    node = head->head.next;
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+    node->prev = node;
+    node->next = node;
+  }
+  pthread_mutex_unlock(&head->mutex);
+  return node;
+}
 
 /************************** free_ring_t definition ****************************/
 
@@ -105,6 +166,9 @@ static void setup_internal(void) {
 #endif
   free_ring_init(&free_ring_queue);
 
+  list_node_init(&alloc_list.head);
+  pthread_mutex_init(&alloc_list.mutex, NULL);
+
   libc_malloc = dlsym(RTLD_NEXT, "malloc");
   libc_free = dlsym(RTLD_NEXT, "free");
   libc_realloc = dlsym(RTLD_NEXT, "realloc");
@@ -120,7 +184,7 @@ static void fill_red_zone(void *ptr) {
 static inline header_t *get_header(void *ptr) {
   header_t *header =
       (header_t *)((uintptr_t)ptr - sizeof(header_t) - RED_ZONE_SIZE);
-  return header->header_magic == HEADER_MAGIC ? header : NULL;
+  return header->cps.magic == HEADER_MAGIC ? header : NULL;
 }
 
 static void *get_raw_ptr(header_t *header) {
@@ -140,8 +204,7 @@ static void *align_to(void *ptr, size_t align) {
 }
 
 static void *fill_metadata_and_take_data_ptr(void *ptr, size_t size,
-                                             size_t align,
-                                             union header_flag flag) {
+                                             size_t align, unsigned f_alloc) {
   char *data, *first_red_zone, *second_red_zone;
   header_t *header;
 
@@ -154,13 +217,19 @@ static void *fill_metadata_and_take_data_ptr(void *ptr, size_t size,
   fill_red_zone(second_red_zone);
 
   header = (header_t *)(first_red_zone - sizeof(header_t));
+  memset(header, 0, sizeof(header_t));
+
   header->data_size = size;
   header->offset = (uintptr_t)data - (uintptr_t)ptr;
-  header->header_magic = HEADER_MAGIC;
-  header->flag.data = flag.data;
+  header->cps.magic = HEADER_MAGIC;
+  header->cps.f_alloc = f_alloc;
 
-  safe_log("++ size %d raw %p  header %p fz %p data %p sz %p\n", size, ptr,
-           header, first_red_zone, data, second_red_zone);
+  list_node_t *node = list_new_node(data);
+  header->cps.alloc_list = list_node_low48(node);
+  list_insert(&alloc_list, node);
+
+  char *lang = f_alloc == F_ALLOC_C ? "C" : "Rust";
+  safe_log("++ %s size %d data %p \n", lang, size, data);
 
   return data;
 }
@@ -169,16 +238,15 @@ static void *malloc_impl(size_t size, size_t align, unsigned f_alloc) {
   pthread_once(&init_once, setup_internal);
 
   size_t alloc_size;
-  void *ptr;
-  union header_flag flag;
+  void *ptr, *data;
 
   safe_log("libmalloc %p\n", libc_malloc);
 
   alloc_size = calc_alloc_size(size, align);
   ptr = libc_malloc(alloc_size);
-  flag.field.f_alloc = f_alloc;
+  data = fill_metadata_and_take_data_ptr(ptr, size, align, f_alloc);
 
-  return fill_metadata_and_take_data_ptr(ptr, size, align, flag);
+  return data;
 }
 
 static int free_impl(void *data, unsigned f_free) {
@@ -198,13 +266,16 @@ static int free_impl(void *data, unsigned f_free) {
   }
 
   raw = get_raw_ptr(header);
-  header->flag.field.f_free = f_free;
+  header->cps.f_free = f_free;
 
-  safe_log("-- size %d raw %p header %p data %p\n", header->data_size, raw,
-           header, data);
+  if (header->cps.alloc_list != 0) {
+    list_node_t *node = (list_node_t *)(uintptr_t)header->cps.alloc_list;
+    list_remove(&alloc_list, node);
+    header->cps.alloc_list = 0;
+  }
 
-  // libc_free(raw);
-  // return 1;
+  char *lang = f_free == F_ALLOC_C ? "C" : "Rust";
+  safe_log("++ %s data %p \n", lang, data);
 
   old = free_ring_push_and_pop(&free_ring_queue, raw);
   if (old) {
@@ -215,10 +286,10 @@ static int free_impl(void *data, unsigned f_free) {
   return 0;
 }
 
-static void *realloc_impl(void *ptr, size_t size, unsigned f_realloc) {
+static void *realloc_impl(void *ptr, size_t size, unsigned f_alloc) {
   void *new_data;
-  header_t *header, *new_header;
-  unsigned f_alloc, f_free;
+  header_t *header;
+  unsigned f_free;
 
   safe_log("realloc size %d ptr %p\n", size, ptr);
 
@@ -236,20 +307,14 @@ static void *realloc_impl(void *ptr, size_t size, unsigned f_realloc) {
     return libc_realloc(ptr, size);
   }
 
-  if (f_realloc == F_REALLOC_R) {
-    f_alloc = F_ALLOC_R;
+  if (f_alloc == F_ALLOC_R) {
     f_free = F_FREE_R;
   } else {
-    f_alloc = F_ALLOC_C;
     f_free = F_FREE_C;
   }
 
   new_data = malloc_impl(size, DEFAULT_ALIGN, f_alloc);
-  new_header = get_header(new_data);
-
   memcpy(new_data, ptr, size < header->data_size ? size : header->data_size);
-  new_header->flag.data = header->flag.data;
-  new_header->flag.field.f_realloc = f_realloc;
 
   free_impl(ptr, f_free);
   return new_data;
@@ -296,7 +361,7 @@ void free(void *ptr) {
 }
 
 void *realloc(void *ptr, size_t size) {
-  return realloc_impl(ptr, size, F_REALLOC_C);
+  return realloc_impl(ptr, size, F_ALLOC_C);
 }
 
 void *calloc(size_t nitems, size_t size) {
@@ -342,7 +407,7 @@ void __ffi_sanitizer_rust_free(void *ptr) {
 }
 
 void *__ffi_sanitizer_rust_realloc(void *ptr, size_t size) {
-  return realloc_impl(ptr, size, F_REALLOC_R);
+  return realloc_impl(ptr, size, F_ALLOC_R);
 }
 
 void *__ffi_sanitizer_rust_calloc(size_t nitems, size_t size) {
@@ -355,6 +420,19 @@ int __ffi_sanitizer_rust_posix_memalign(void **memptr, size_t alignment,
 }
 
 header_t *__ffi_sanitizer_get_header(void *ptr) { return get_header(ptr); }
+
+void __ffi_sanitizer_put_alloc_list(void *data) {
+  header_t *header;
+  list_node_t *node;
+
+  header = get_header(data);
+  if (!header)
+    return;
+
+  node = list_new_node(data);
+  header->cps.alloc_list = list_node_low48(node);
+  list_insert(&alloc_list, node);
+}
 
 __attribute__((destructor)) void cleanup(void) {
 #ifdef DEBUG

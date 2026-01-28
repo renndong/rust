@@ -2,36 +2,29 @@
 #define __FFISAN_H__
 
 #include <stddef.h>
+#include <stdint.h>
 
 #define RED_ZONE_SIZE 16
 #define RED_ZONE_PATTERN 0xDEADBEEF
-#define HEADER_MAGIC 0xABCDABCD
+#define HEADER_MAGIC 0xABC
 
 #define DEFAULT_ALIGN 16
 
 #define F_ALLOC_R 0b01
 #define F_ALLOC_C 0b10
-#define F_REALLOC_R 0b01
-#define F_REALLOC_C 0b10
 #define F_FREE_R 0b01
 #define F_FREE_C 0b10
 #define F_OWNED 0b1
 
-union header_flag {
-  struct {
-    unsigned f_alloc : 2;
-    unsigned f_free : 2;
-    unsigned f_realloc : 2;
-    unsigned f_owned : 1;
-  } field;
-  unsigned data;
-};
-
 typedef struct header {
   unsigned int data_size;
   unsigned int offset;
-  union header_flag flag;
-  unsigned header_magic;
+  struct {
+    uintptr_t alloc_list : 48;
+    unsigned magic: 12;
+    unsigned f_alloc : 2;
+    unsigned f_free : 2;
+  } cps;
 } header_t;
 
 // for c/c++ program
@@ -52,6 +45,7 @@ int __ffi_sanitizer_rust_posix_memalign(void **memptr, size_t alignment,
                                         size_t size);
 
 header_t *__ffi_sanitizer_get_header(void *ptr);
+void __ffi_sanitizer_put_alloc_list(void *data);
 
 #ifdef __FFISAN_INNER__
 // the following define is only available in ffisan library, and
@@ -66,6 +60,19 @@ typedef struct free_ring {
   size_t tail;
   pthread_mutex_t mutex;
 } free_ring_t;
+
+typedef struct list_node {
+  struct list_node *prev;
+  struct list_node *next;
+  void *self;
+} list_node_t;
+
+typedef struct list_head {
+  list_node_t head;
+  pthread_mutex_t mutex;
+} list_head_t;
+
+
 
 #endif
 
