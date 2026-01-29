@@ -581,5 +581,13 @@ unsafe extern "C" {
     pub fn __ffi_sanitizer_get_header(ptr: *mut ::core::ffi::c_void) -> *mut header_t;
 }
 unsafe extern "C" {
-    pub fn __ffi_sanitizer_put_alloc_list(data: *mut ::core::ffi::c_void);
+    pub fn __ffi_sanitizer_print_leak_summary() -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn __ffi_sanitizer_put_alloc_list(
+        data: *mut ::core::ffi::c_void,
+        file: *mut ::core::ffi::c_char,
+        len: ::core::ffi::c_uint,
+        line: ::core::ffi::c_uint,
+    );
 }

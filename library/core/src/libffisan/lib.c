@@ -54,12 +54,16 @@ static inline void list_node_init(list_node_t *node) {
   node->next = node;
 }
 
-static list_node_t *list_new_node(void *self) {
+static list_node_t *list_new_node(void *self, char *file, unsigned len,
+                                  unsigned line) {
   list_node_t *node;
 
   node = (list_node_t *)libc_malloc(sizeof(list_node_t));
   list_node_init(node);
   node->self = self;
+  node->last_file = file;
+  node->len = len;
+  node->last_line = line;
   return node;
 }
 
@@ -224,12 +228,8 @@ static void *fill_metadata_and_take_data_ptr(void *ptr, size_t size,
   header->cps.magic = HEADER_MAGIC;
   header->cps.f_alloc = f_alloc;
 
-  list_node_t *node = list_new_node(data);
-  header->cps.alloc_list = list_node_low48(node);
-  list_insert(&alloc_list, node);
-
-  char *lang = f_alloc == F_ALLOC_C ? "C" : "Rust";
-  safe_log("++ %s size %d data %p \n", lang, size, data);
+  safe_log("++ size %d raw %p  header %p fz %p data %p sz %p\n", size, ptr,
+           header, first_red_zone, data, second_red_zone);
 
   return data;
 }
@@ -271,11 +271,12 @@ static int free_impl(void *data, unsigned f_free) {
   if (header->cps.alloc_list != 0) {
     list_node_t *node = (list_node_t *)(uintptr_t)header->cps.alloc_list;
     list_remove(&alloc_list, node);
+    libc_free(node);
     header->cps.alloc_list = 0;
   }
 
-  char *lang = f_free == F_ALLOC_C ? "C" : "Rust";
-  safe_log("++ %s data %p \n", lang, data);
+  safe_log("-- size %d raw %p header %p data %p\n", header->data_size, raw,
+           header, data);
 
   old = free_ring_push_and_pop(&free_ring_queue, raw);
   if (old) {
@@ -419,9 +420,14 @@ int __ffi_sanitizer_rust_posix_memalign(void **memptr, size_t alignment,
   return posix_memalign_impl(memptr, alignment, size, F_ALLOC_R);
 }
 
-header_t *__ffi_sanitizer_get_header(void *ptr) { return get_header(ptr); }
+header_t *__ffi_sanitizer_get_header(void *ptr) {
+  if (ptr)
+    return get_header(ptr);
+  return NULL;
+}
 
-void __ffi_sanitizer_put_alloc_list(void *data) {
+void __ffi_sanitizer_put_alloc_list(void *data, char *file, unsigned len,
+                                    unsigned line) {
   header_t *header;
   list_node_t *node;
 
@@ -429,9 +435,37 @@ void __ffi_sanitizer_put_alloc_list(void *data) {
   if (!header)
     return;
 
-  node = list_new_node(data);
-  header->cps.alloc_list = list_node_low48(node);
+  if (header->cps.alloc_list != 0) {
+    node = (list_node_t *)(uintptr_t)header->cps.alloc_list;
+    list_remove(&alloc_list, node);
+    node->last_file = file;
+    node->len = len;
+    node->last_line = line;
+  } else {
+    node = list_new_node(data, file, len, line);
+    header->cps.alloc_list = list_node_low48(node);
+  }
   list_insert(&alloc_list, node);
+}
+
+int __ffi_sanitizer_print_leak_summary() {
+  list_node_t *node;
+  header_t *header;
+  int leaked = 0;
+
+  for (node = list_pop_front(&alloc_list); node;
+       node = list_pop_front(&alloc_list)) {
+    leaked = 1;
+
+    printf("FFI Probe: memory leak detected, addr: %p, may be around %.*s:%u\n",
+           node->self, node->len, node->last_file, node->last_line);
+    header = get_header(node->self);
+    if (header)
+      header->cps.alloc_list = 0;
+    libc_free(node);
+  }
+
+  return leaked;
 }
 
 __attribute__((destructor)) void cleanup(void) {

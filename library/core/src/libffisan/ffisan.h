@@ -21,7 +21,7 @@ typedef struct header {
   unsigned int offset;
   struct {
     uintptr_t alloc_list : 48;
-    unsigned magic: 12;
+    unsigned magic : 12;
     unsigned f_alloc : 2;
     unsigned f_free : 2;
   } cps;
@@ -45,7 +45,8 @@ int __ffi_sanitizer_rust_posix_memalign(void **memptr, size_t alignment,
                                         size_t size);
 
 header_t *__ffi_sanitizer_get_header(void *ptr);
-void __ffi_sanitizer_put_alloc_list(void *data);
+int __ffi_sanitizer_print_leak_summary();
+void __ffi_sanitizer_put_alloc_list(void *data, char *file, unsigned len, unsigned line);
 
 #ifdef __FFISAN_INNER__
 // the following define is only available in ffisan library, and
@@ -64,6 +65,9 @@ typedef struct free_ring {
 typedef struct list_node {
   struct list_node *prev;
   struct list_node *next;
+  char *last_file;
+  unsigned len;
+  unsigned last_line;
   void *self;
 } list_node_t;
 
@@ -71,8 +75,6 @@ typedef struct list_head {
   list_node_t head;
   pthread_mutex_t mutex;
 } list_head_t;
-
-
 
 #endif
 
