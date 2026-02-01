@@ -581,6 +581,9 @@ unsafe extern "C" {
     pub fn __ffi_sanitizer_get_header(ptr: *mut ::core::ffi::c_void) -> *mut header_t;
 }
 unsafe extern "C" {
+    pub fn __ffi_sanitizer_check_red_zone(ptr: *mut ::core::ffi::c_void) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn __ffi_sanitizer_print_leak_summary() -> ::core::ffi::c_int;
 }
 unsafe extern "C" {

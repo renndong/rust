@@ -468,6 +468,24 @@ int __ffi_sanitizer_print_leak_summary() {
   return leaked;
 }
 
+int __ffi_sanitizer_check_red_zone(void *ptr) {
+  header_t *header;
+  unsigned *first, *second;
+
+  if (!ptr)
+    return 0;
+  header = get_header(ptr);
+
+  first = (unsigned *)((uintptr_t)ptr - RED_ZONE_SIZE);
+  second = (unsigned *)((uintptr_t)ptr + header->data_size);
+
+  for (size_t i = 0; i < RED_ZONE_SIZE / sizeof(unsigned); i++) {
+    if (first[i] != RED_ZONE_PATTERN || second[i] != RED_ZONE_PATTERN)
+      return 1;
+  }
+  return 0;
+}
+
 __attribute__((destructor)) void cleanup(void) {
 #ifdef DEBUG
   int buffered = free_ring_count(&free_ring_queue);

@@ -45,6 +45,7 @@ int __ffi_sanitizer_rust_posix_memalign(void **memptr, size_t alignment,
                                         size_t size);
 
 header_t *__ffi_sanitizer_get_header(void *ptr);
+int __ffi_sanitizer_check_red_zone(void *ptr);
 int __ffi_sanitizer_print_leak_summary();
 void __ffi_sanitizer_put_alloc_list(void *data, char *file, unsigned len, unsigned line);
 

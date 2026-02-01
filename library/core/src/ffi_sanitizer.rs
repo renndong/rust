@@ -99,6 +99,11 @@ pub unsafe fn ffi_sanitizer_ffi_post_cond<T: PointeeSized>(pointer: *const T, re
                 alloc_lang, free_lang
             );
         }
+
+        // out-of-bound
+        if libffisan::__ffi_sanitizer_check_red_zone(pointer as *mut ffi::c_void) != 0 {
+            panic!("FFI Probe: out-of-bound detected.");
+        }
     }
 }
 
