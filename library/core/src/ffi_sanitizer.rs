@@ -62,7 +62,7 @@ pub unsafe fn ffi_sanitizer_ffi_pre_cond<T: PointeeSized>(pointer: *const T) {
     unsafe {
         let Some(header) = ffi_sanitizer_header_ref(pointer) else { return };
         if header.cps.f_free() != 0 {
-            panic!("FFI Probe: object is freed before ffi call");
+            panic!("FFI Probe: use-after-free, object {:?} is freed before ffi call", pointer);
         }
         ffi_sanitizer_put_alloc_list(pointer, Location::caller());
     }
@@ -126,7 +126,7 @@ pub unsafe fn ffi_sanitizer_use_pre_cond<T: PointeeSized>(pointer: *const T) {
     unsafe {
         let Some(header) = ffi_sanitizer_header_ref(pointer) else { return };
         if header.cps.f_free() == F_ALLOC_R || header.cps.f_free() == F_ALLOC_C {
-            panic!("FFI Probe: use-after-free detected");
+            panic!("FFI Probe: use-after-free detected, addr {:?}", pointer);
         }
     }
 }
@@ -140,3 +140,4 @@ pub unsafe fn ffi_sanitizer_exit_pre_cond() {
         panic!("FFI Probe: memory leak detected");
     }
 }
+

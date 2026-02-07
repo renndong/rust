@@ -252,7 +252,7 @@ static void *malloc_impl(size_t size, size_t align, unsigned f_alloc) {
 static int free_impl(void *data, unsigned f_free) {
   pthread_once(&init_once, setup_internal);
 
-  void *raw, *old;
+  void *old;
   header_t *header;
 
   if (!data)
@@ -265,7 +265,6 @@ static int free_impl(void *data, unsigned f_free) {
     return 0;
   }
 
-  raw = get_raw_ptr(header);
   header->cps.f_free = f_free;
 
   if (header->cps.alloc_list != 0) {
@@ -275,13 +274,13 @@ static int free_impl(void *data, unsigned f_free) {
     header->cps.alloc_list = 0;
   }
 
-  safe_log("-- size %d raw %p header %p data %p\n", header->data_size, raw,
-           header, data);
+  safe_log("-- size %d header %p data %p\n", header->data_size, header, data);
 
-  old = free_ring_push_and_pop(&free_ring_queue, raw);
+  old = free_ring_push_and_pop(&free_ring_queue, data);
   if (old) {
-    safe_log("realfree %p\n", old);
-    libc_free(old);
+    header = get_header(old);
+    header->cps.magic = 0;
+    libc_free(get_raw_ptr(header));
     return 1;
   }
   return 0;

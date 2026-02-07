@@ -20,8 +20,10 @@ impl<'tcx> crate::MirPass<'tcx> for FFISanitizer {
             return;
         }
         if has_ffi_call(tcx, body) {
+            println!("FFISanitizer");
             instrument_func_with_ffi_call(tcx, body);
         } else if can_be_ffi_call(tcx, body) {
+            println!("FFISanitizer");
             instrument_func_can_be_ffi_call(tcx, body);
         }
         if is_main_function(tcx, body) {
@@ -510,13 +512,10 @@ struct DerefVisitor<'tcx> {
 
 impl<'tcx> Visitor<'tcx> for DerefVisitor<'tcx> {
     fn visit_place(&mut self, place: &Place<'tcx>, _: PlaceContext, _: Location) {
-        println!("check {:?}", place);
-
         let Some(p) = place.projection.get(0) else { return };
         if matches!(p, ProjectionElem::Deref) {
             let base_place = mir::Place { local: place.local, projection: ty::List::empty() };
 
-            println!("-------- {:?}", base_place);
             self.vars.push(base_place);
         }
     }
